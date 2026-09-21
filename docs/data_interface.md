@@ -1,78 +1,94 @@
-# 可替换数据接口 v2
+# v3 申报集合鲁棒模型输入接口
 
-通用算法直接接受 Python 字典或 UTF-8 JSON：`Case(data)` / `Case.from_json(path)`。最小示例见 `data/minimal_case.json`。算法与特定网架构建分离。
+本接口依据模型 v3，使用 `schema_version=3`。`Case(dict)` 或 `Case.from_json(path)` 读取输入；JSON 为 UTF-8。N 为节点数、K 为用户数、S 为储能数、T 为等长时段数、M 为激励档位数。二维数组始终按“实体、时段”排列。最小完整输入见 `data/minimal_case.json`。
 
-## 单位与排列
+## 网络与时序
 
-功率 MW，无功 MVAr，电量 MWh，时间小时，阻抗 Ω，节点电压幅值 p.u.，价格元/MWh（也可整套换成同一其他货币）。模型中的 L、ξ、d 是整个周期的归一化电量份额，不是 MW，也不是相对每小时负荷的百分比。
-
-设 N 个节点、M 条在运支路、K 个 DR 用户/聚合商、S 台储能、T 个时段。所有时序二维数组第二维都是时间；节点行顺序与 `bus_ids` 对齐；DR 列/行顺序在分配矩阵、预测负荷、阈值和偏差界中一致。时间步长在同一个算例内固定。
-
-## 必填字段
-
-| 字段 | 类型或维度 | 定义 |
-| --- | --- | --- |
-| `schema_version` | 整数 2（兼容满足新模型条件的1） | 接口版本 |
-| `name` | 字符串 | 算例名 |
-| `bus_ids` | N 个唯一 ID | 节点 ID 不必连续，可按任意顺序排列 |
-| `root_bus` | 一个上述 ID | 外部交换根节点 |
-| `base_kv` | 正数 | 线电压基准 kV；当前不建模多电压等级变压器 |
-| `dt_hours` | 正数 | 固定时段长度 |
-| `branches` | M 个对象 | `from_bus,to_bus,r_ohm,x_ohm`，加对称`p_limit_mw`或独立`p_min_mw,p_max_mw` |
-| `rigid_p_mw` | N×T | 已扣除 DR 部分的刚性有功负荷 |
-| `fixed_q_mvar` | N×T | 固定预测净无功，可包含无功注入的负值；不随 DR 调整 |
-| `renewable_p_mw` | N×T | 预测可用新能源出力，模型中全额接纳 |
-| `dr_allocation` | N×K | 每列非负、和为 1，将一个 DR 用户的有功分配到各节点 |
-| `dr_pre_mw` | K×T | DR 部分预测有功曲线；用于计算周期电量 |
-| `storage` | S 个对象，可为空列表 | 详见下表 |
-| `root_voltage_pu` | 正数 | 固定根节点电压幅值 |
-| `voltage_min_pu` / `voltage_max_pu` | 标量或 N 数组 | 电压幅值边界，不要自行平方 |
-| `grid_min_mw` / `grid_max_mw` | 标量或 T 数组 | 实际交换有功边界；负下界允许反送 |
-| `incentive_prices_per_mwh` | 长度 4 | 严格递增的四档价格标签 |
-| `response_thresholds` | K×4 | 各用户四档阈值，范围 (0,1]，逐行非递减 |
-| `beta` | 正数 | `R=exp(−βΣξ²)` 的尺度参数 |
-| `xi_lower` / `xi_upper` | K×T | 固定逐时偏差申报范围 |
-| `diagnostic_penalty` | 正数 | 辅助时移平方惩罚 ρ |
-
-储能对象的全部字段：
-
-| 字段 | 定义 |
+| 字段 | 格式与限制 |
 | --- | --- |
-| `bus` | 所在非根节点 ID |
-| `p_charge_mw` / `p_discharge_mw` | 非负充/放电功率上限 |
-| `e_min_mwh` / `e_max_mwh` | 电量上下界 |
-| `e_initial_mwh` | 起始电量；也作为末端电量要求 |
-| `eta_charge` / `eta_discharge` | 可省略，默认为1；如提供必须等于1，当前模型禁止有损效率 |
-| `cost_per_mwh` | 非负吞吐成本；充电和放电均计 |
+| schema_version / name | 3 / 算例名称字符串 |
+| bus_ids / root_bus | N 个不重复节点 ID，root_bus 必须在其中；N≥2，可非连续或乱序 |
+| base_kv / dt_hours | 单电压等级 kV / 正的等长时段长度 h；T≥2，不限定 24 时段 |
+| branches | N−1 条连通树支路；每条有 from_bus、to_bus、r_ohm、x_ohm |
+| 支路有功界 | p_limit_mw 表示对称界；或提供 p_min_mw、p_max_mw。按输入方向解释，自动根定向时同步转换 |
+| rigid_p_mw | N×T 非负刚性负荷 MW，必须已扣除 DR 部分 |
+| renewable_p_mw | N×T 非负可用新能源 MW，全额消纳 |
+| fixed_q_mvar | N×T 已知净无功 Mvar，包括负荷减去给定注入，可为负 |
+| dr_pre_mw | K×T 未响应预测负荷 MW，非负，每用户周期电量必须为正 |
+| dr_allocation | N×K，每列只有一个 1，其余为 0；每用户固定接入一个节点 |
+| root_voltage_pu | 根节点电压幅值 p.u. |
+| voltage_min_pu / voltage_max_pu | 标量或长度 N 的幅值界，代码内部平方 |
+| grid_min_mw / grid_max_mw | 标量或长度 T 的交换功率界，正值为进口 |
+| user_ids / storage_ids | 可选，长度 K / S 的不重复标识 |
 
-独立上下界以输入from_bus→to_bus为正方向，反向定向时自动变为[-upper,-lower]。`user_ids`、`storage_ids`可选，若给定需长度一致且唯一。
+根节点是纯外部交换节点，刚性负荷、无功、新能源和 DR 分配的对应行必须为零，储能也不能放在根节点。schema 3 的节点诊断要求单节点用户；跨节点聚合体应拆为多个固定节点用户。
 
-可选字段：`seed` 为实验随机种子；`provenance` 可存数据来源、日期、文件哈希和实验假设，不参与优化。
+## 储能
 
-## 接口约束
+`storage` 为 S 个字典的列表，允许 `[]`。每项必须包含：`bus`、`p_charge_mw`、`p_discharge_mw`、`e_min_mwh`、`e_max_mwh`、`e_initial_mwh`。功率 MW，电量 MWh，均非负，初始电量在容量界内。
 
-- 仅支持连通辐射状网架，M=N−1；支路输入方向与顺序任意，算法自动从根定向，每个非根节点恰好一个父节点。开关断开的支路在送入算法前移除。
-- 根节点只代表外部交换，刚性负荷、固定无功、新能源和 DR 分配在根节点行均为零，储能接在下游节点。
-- 至少一个 DR 用户、两个时段。每个 DR 用户周期电量严格为正。无 DR 的 B0 是外部对照，不作为算法准线输入。
-- 支路上下界是有限的**有功**限制，允许独立不对称上下界；没有视在功率或热模型。原始数据中没有限额的字段需要实验者显式补齐。
-- 固定 q 直接作为网络净无功使用。如果新数据含新能源无功，请在数据整理阶段从负荷无功中扣除，避免重复统计。
-- 聚合用户的单列分配固定不随时间变化。若用户迁移位置或逐节点独立响应，需要拆分成多个用户，不能用一个固定列近似却不说明。
-- 不接受 NaN/Inf；输入的负荷、分配、新能源及不确定性界均进行一致性检查。原计划不满足交换限额、准线不满足网络、响应集合为空时明确报错。
+`eta_charge`、`eta_discharge` 默认 1，当前模型只接受 1。终端电量固定为初始电量。设备级旧字段 `cost_per_mwh` 只为兼容保留，在 schema 3 中不参与目标；每台设备必须提供非负有限 `throughput_cost_coefficient`，对应式（31）的 c_e。
 
-## 单节点用户与聚合商
+## 激励、申报和成本
 
-如果用户 k 只接在节点 a，令 `dr_allocation[index(a),k]=1`，其余行置零。若用户 k 是多个节点的聚合商，给定非负份额列，总和为 1。相同归一化时序被施加到该列所有节点，这是假设，不是算法推断出来的用户行为。
+| 字段 | 格式与限制 |
+| --- | --- |
+| incentive_prices_per_mwh | 长度 M 的非负严格递增电价，M≥1，不再固定为四档 |
+| response_degrees | K×M，rho∈[0,1]，每行随档位非递减 |
+| deviation_factors | K×M，s∈[0,1)，不强制随档位单调 |
+| storage[e].throughput_cost_coefficient | 每设备非负系数，式（31）的 c_e |
 
-原始总负荷应满足 `P_total = rigid_p_mw + dr_allocation @ dr_pre_mw`。不要把未拆分的总负荷同时放进 `rigid_p_mw` 和 `dr_pre_mw`。
+鲁棒可行性目标为最坏情况下最小全网虚拟量之和，成本单独求解为 `sum_e c_e*sum_t(charge_mw+discharge_mw)`，没有额外 dt。若成本按货币/MWh 给定，应先乘 dt。v2 草稿的 slack_penalty、全局 throughput_coefficient 必须删除，代码会明确拒绝。两张响应表是算例假设或事先收集的用户参数，不是算法拟合得到的真实响应。激励电价用于发布和记录，不另外加到式（31）的储能目标。
 
-## 更换时间分辨率
+## 调用与真实申报接口
 
-通用算法对 Δt 使用统一换算，测试覆盖 15 分钟、1 小时及 6 小时。若把 24 小时改为 96 点，需给所有时序字段 96 点、`dt_hours=0.25`，重新计算/标定无量纲 ξ 申报界及 β/响应阈值；不能原样复制小时尺度预算，假称行为含义不变。
+```python
+case = Case.from_json('data/minimal_case.json')
+result = run_two_stage(case, SolverOptions(time_limit=60))
+```
 
-通用算法不要求周期必须为24小时。准备任意T个等长时段的数据即可，T至少为2。
+未传回调时，每一轮根据表中 rho、s 生成式（18）的申报曲线，输出明确标记 `preset_response_table`。真实系统可使用 `declaration_provider(context)`：
 
-## 输入来源建议
+```python
+def provider(context):
+    # 从业务系统读取此轮已经取得的申报；算法本身不会给用户发送消息。
+    # context: round_index, levels, target_dr_mw, forecast_dr_mw,
+    #          prices_per_mwh, previous_round
+    return {
+        'response_degree': [0.8],       # K 个值
+        'deviation_factor': [0.1],      # K 个值
+        'declared_p_mw': [[0.46, 0.34]] # 可省略，提供时须符合式（18）
+    }
 
-CSV、数据库、实测数据都可在独立数据准备脚本中转为本接口。该脚本负责单位、时区、缺测处理、用户分组和来源记录；`lcdl_algorithm.py` 只处理已经明确单位与维度的优化数据。不要在求解过程中静默填补缺测或推测资源额定容量。
+result = run_two_stage(case, declaration_provider=provider)
+```
 
-外部交换在第二阶段固定，无补电变量或补电单价。旧schema=1数据只有满足理想效率等新假设才可读取；旧有损数据会明确拒绝，不能静默改变物理假设。多节点固定比例分配只是可选扩展，需研究者明确其关联响应假设。
+回调返回 `None` 表示尚未收到申报：返回 `awaiting_declaration` 和 `stage2.requested_levels`，不假装已收到反馈。业务层可以保存结果，在收到数据后用 `initial_levels` 启动下一次调用；每次调用的轮次历史独立，应由业务层关联跨调用记录。单次循环内会检查重新申报的 rho 非递减。回调异常的业务处理由调用方负责，格式/模型数据错误返回 `invalid_declaration`。
+
+反馈必须提供 K×T 的已确认整周期负荷 MW。schema 3 的 `validate_feedback`、`dispatch_feedback` 第三个参数是完整的 `stage2.declaration`，不能只传档位，以免误用预设表替代真实申报。
+
+```python
+execution = dispatch_feedback(case, result['stage1'],
+                              result['stage2']['declaration'], [[0.47, 0.33]])
+# 或一次性完成：run_two_stage(case, feedback_p_mw=[[0.47, 0.33]])
+```
+
+## 显式迁移其他算例
+
+```python
+from lcdl_algorithm import with_declaration_model
+new_data = with_declaration_model(old_data,
+    response_degrees=rho_table, deviation_factors=s_table,
+    storage_cost_coefficients=cost_per_mw_step_per_device)
+case = Case(new_data)
+```
+
+这会复制原拓扑、负荷和设备参数，移除旧鲁棒集合字段，但不会推算 rho、s。换成其他拓扑时同步更新所有 N 维数组、支路端点和设备节点；换成其他时段数时更新所有 T 维数组。网状网络、多电压等级、有损储能、未知无功或实时滚动反馈需要扩展模型，不能仅靠换数据支持。
+
+## 全域求解选项
+
+`SolverOptions(declaration_vertex_limit=256)` 控制完整顶点枚举的安全规模上限，0 强制使用全局对偶检验。超限不会截取部分顶点后声称鲁棒，而是切换方法。`optimize_robust_cost=False` 只验证鲁棒可行性，跳过可选的式（31）。
+
+`feasibility_tol` 是全域虚拟量零判定容差，`upgrade_tol` 是同一联合解中 H 指标的升档容差，二者均针对按时段求和的 MW 数值。`cost_abs_tol`、`cost_rel_tol` 用于成本上下界。`time_limit` 对每次内层或全局求解生效，不是整个流程总时限。`max_iterations`、`two_period_vertex_limit` 属于旧 schema 1/2 路径，不控制 v3 的完整枚举或全局对偶。
+
+不确定量 delta 使用 MW，不再使用旧模型的无量纲 xi 或二次预算。每轮新申报中心及 s 都会重新构建完整集合。
