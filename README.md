@@ -1,103 +1,90 @@
 # LCDL Optimizer
 
-A reusable Python implementation of two-stage load-directrix and ideal-storage robust optimization for radial distribution networks.
+Reusable Python two-stage load-directrix and ideal-storage robust correction for radial networks.
 
-可复用的“负荷准线优化—储能响应补偿”两阶段算法。输入自定义网架、负荷、新能源、储能及响应参数，输出统一准线、节点准线和逐情景储能调度，以及完整的全局验证状态。
+0.3.0 对应《模型v3 联合补偿修订版》：**节点准线 → 用户申报曲线与偏差集合 → 全域储能鲁棒校正 → 同一联合解的节点缺口诊断升档 → 确认反馈复核**。算法不依赖 IEEE33，拓扑、负荷、储能与用户参数通过数据接口传入。
 
-仓库只包含通用算法、接口文档、合成最小数据、运行示例及通用测试；不依赖研究论文附件或特定IEEE网架数据。
+新输入使用 `schema_version=3`。历史 schema 1/2 的鲁棒接口仍兼容；未发布的 v2 单曲线草稿已被替换。
 
-## 安装
+## 安装运行
 
-Python 3.10及以上，使用Gurobi求解。Gurobi及其许可不包含在本项目中，请自行取得适用于你的用途和模型规模的许可。MIT仅覆盖本仓库代码与文档，不改变第三方依赖的许可条件。
-
-在克隆后的仓库根目录执行：
+Python 3.10+，需要适用的 Gurobi 许可；本仓库的 MIT 许可不覆盖 Gurobi。
 
 ```bash
+git clone https://github.com/guangxufeng/lcdl-optimizer.git
+cd lcdl-optimizer
 python -m venv .venv
-# 激活虚拟环境：Windows PowerShell用 .venv\Scripts\Activate.ps1
-# Linux/macOS用 source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
 python -m pip install -e ".[dev]"
 python examples/run_minimal.py
 python -m pytest -q
 ```
 
-## 接口示例
+运行自定义算例，并保存完整过程与约束矩阵：
 
-```python
-import numpy as np
-from lcdl_algorithm import (
-    Case, SolverOptions, run_two_stage, export_result, dispatch_feedback,
-)
-
-case = Case.from_json("data/minimal_case.json")
-options = SolverOptions(time_limit=60, max_iterations=30)
-result = run_two_stage(case, options)
-print(result["status"], result["reason"])
-
-if result["feasibility_certified"]:
-    # 此反馈仅用于随仓库附带的两时段、单用户示例。
-    # 自定义算例时替换为用户确认的K×T负荷功率矩阵，单位MW。
-    feedback = np.array([[0.44, 0.36]])
-    execution = dispatch_feedback(
-        case, result["stage1"], result["stage2"]["levels"], feedback, options,
-    )
-    result["execution"] = execution
-    if execution["status"] == "optimal":
-        print(execution["dispatch"]["mode_z"])
-
-export_result(result, "results/run/complete.json", include_matrices=True)
+```bash
+python run_declaration.py --case data/minimal_case.json --output results/run/result.json
+# feedback.json 为 K×T 已确认整周期负荷 MW 数组
+python run_declaration.py --case data/minimal_case.json --feedback feedback.json
+# 只检验鲁棒可行性，跳过可选最坏成本优化
+python run_declaration.py --case data/minimal_case.json --skip-cost
 ```
 
-最小例子的完整脚本在[examples/run_minimal.py](examples/run_minimal.py)，输入在[data/minimal_case.json](data/minimal_case.json)。预计得到U=L=[0.5,0.5]，反馈调度先放电0.04 MW再充电0.04 MW，初末电量都为1 MWh，吞吐成本0.08。该例是合成教程，不是实测数据或大规模性能基准。
+## Python 接口
 
-## 更换数据
+```python
+from lcdl_algorithm import Case, SolverOptions, run_two_stage, export_result
 
-详见[输入接口](docs/data_interface.md)。`Case(data)`接受Python字典，`Case.from_json(path)`接受UTF-8 JSON。数据数组按“实体×时间”排列：N节点、K用户、S储能、T时段。
+case = Case.from_json('data/minimal_case.json')
+result = run_two_stage(case, SolverOptions(time_limit=60),
+                       feedback_p_mw=[[0.47, 0.33]])  # 仅用于随附最小例子
+print(result['status'], result['feasibility_certified'], result['executable'])
+print(result['stage1']['U'], result['stage1']['L'])
+for row in result['stage2']['rounds']:
+    eta = row['operational']['feasibility']
+    print(row['levels'], eta['lower_bound'], eta['upper_bound'])
+export_result(result, 'results/run/result.json', include_matrices=True)
+```
 
-| 数据 | 主要字段 |
-| --- | --- |
-| 网络 | bus_ids、root_bus、base_kv、branches；支路阻抗Ω、有功限额MW |
-| 时序 | dt_hours，N×T的rigid_p_mw、fixed_q_mvar、renewable_p_mw |
-| DR用户 | N×K的dr_allocation，K×T的dr_pre_mw，周期电量须为正 |
-| 储能 | 接入节点、功率MW、电量MWh、初始电量、非负吞吐成本；效率必须为1 |
-| 网络界 | 电压p.u.、根电压、交换功率上下界 |
-| 响应集合 | 四档价格、K×4响应阈值、beta、K×T偏差上下界、诊断惩罚 |
+省略 feedback 时，即使已证明鲁棒可行，顶层 executable 仍为 false，等待真实反馈。`declaration_provider(context)` 可对接实际申报；未传回调时使用数据表模拟申报并标记来源，算法不会代替用户实际申报或发送通知。
 
-刚性负荷必须已经扣除DR部分，避免重复计量；净无功包括负荷减去给定无功注入。一个情景ξ是所有用户整个周期的偏差矩阵，不是一个时段的单个随机数。
+- [输入格式、单位、申报回调、迁移和求解选项](docs/data_interface.md)
+- [完整输出、上下界、情景调度和矩阵导出](docs/output_interface.md)
+- [公式对应、全域验证方法和修订式（38）的含义](docs/model.md)
 
-## 输出和分阶段调用
+分阶段接口包括 `compute_unified_directrix`、`compute_directrix`、`make_declaration`、`DeclaredUncertaintySet`、`DeclarationSystem`、`solve_declared_dispatch`、`declared_global_oracle`、`solve_declared_robust`、`joint_gap_diagnostic`、`run_incentive_loop`、`validate_feedback` 和 `dispatch_feedback`。
 
-完整字段和维度见[输出接口](docs/output_interface.md)。
+## 最小例子与判定
 
-- `result['stage1']`：U、UG、Eg、L、alpha、目标功率、固定交换、网络状态及守恒残差。
-- `result['stage2']['rounds']`：逐轮档位、响应预算、运行/诊断情景、模式、功率、SOC、成本及全局搜索记录。
-- `axes`和`parameters`：实体顺序、时刻、已定向支路、网络矩阵和数据快照。
-- `export_result(..., include_matrices=True)`：输出JSON和A/B/C/F稀疏矩阵、成本系数、缩放尺度及变量切片。
+[合成最小算例](data/minimal_case.json)为两个节点、两个时段、一个用户、一台储能。预测负荷 [0.7,0.1] MW，目标 [0.4,0.4] MW；四档 rho=[0,0.5,0.8,1]，s=[0.1,0.1,0.1,0.05]。
 
-单独调用入口：`compute_unified_directrix`、`compute_directrix`、`UncertaintySet`、`solve_scenario`、`solve_robust`、`validate_feedback`、`dispatch_feedback`。单情景接口不自动证明全域鲁棒性；模拟ξ时先用`UncertaintySet.contains`检查归属。正式升档推荐使用总入口`run_two_stage`。
+| 档位 | 申报中心 MW | 全域最坏最小虚拟量 eta | 处理 |
+| --- | --- | --- | --- |
+| 1 | [0.7,0.1] | 0.42 | H 超过容差，升档 |
+| 2 | [0.55,0.25] | 0.15 | H 超过容差，升档 |
+| 3 | [0.46,0.34] | 0 | 鲁棒可行 |
 
-## 适用范围与结果判定
+eta 是全节点、全时段虚拟功率之和。第三档最坏储能成本 J=0.188；示例反馈 [0.47,0.33] MW 的实际成本为 0.14，储能先放电 0.07 MW、再充电 0.07 MW，电量 [1,0.93,1] MWh。这是合成教程，不是实测数据或性能基准。
 
-当前范围：单电压等级、固定辐射拓扑、无损LinDistFlow、理想储能、已知净无功，以及执行前确认完整周期反馈。支持不同规模、非连续节点编号、乱序/反向支路、独立线路上下界及零台储能。网状网络、有损储能、AC/三相潮流和实时非预知策略需要另行扩展模型。
+`feasibility_certified`/`robust_certified` 表示当前整个申报集合零虚拟量可行；`cost_optimality_certified` 独立表示可选 J 成本界闭合；`executable` 要求确认反馈物理复核通过。成本尚未收敛但可行性已证明时，明确返回 `robust_feasible_cost_unverified`。
 
-储能模式按情景自适应。默认利用理想效率和非负成本的严格等价性求连续模型，再恢复互斥充放电模式；可用`solve_scenario(..., explicit_mip=True)`交叉检查显式二进制模型。推导见[模型说明](docs/model.md)。
+## 重要模型含义
 
-**抽样全部通过不等于鲁棒证书。**
+申报中心为 Pdec=Ppre+rho(Ptar−Ppre)，不确定量 delta 使用 MW，满足 ±sPdec 盒界、每用户周期零和及实际负荷非负。新一轮中心移动时集合未必嵌套，必须重新验证。
 
-| 字段/状态 | 含义 |
-| --- | --- |
-| feasibility_certified | 完整申报集合的零松弛可行性已通过 |
-| cost_optimality_certified | 最坏成本的全局界满足精度 |
-| robust_certified / robust_optimal | 上述两项均通过 |
-| unverified | 尚未证实，例如全局搜索超时；不等于不可行，不因此升档 |
-| stage1_failed | 第一阶段失败，已算中间参数保留 |
-| invalid_uncertainty | 申报集合为空或不相容 |
-| proven_infeasible | 当前被检验模型有不可行证明，需结合所在轮次和诊断/运行作用域解释 |
-| no_feasible_scheme / stalled | 无可升级用户或诊断指标没有触发升档 |
-| 反馈out_of_set / energy_changed | 重建响应范围，或重建两个阶段 |
+鲁棒可行性先单独最小化虚拟量，再检查其全域最坏值；成本在零虚拟量条件下另解，不使用有限惩罚权衡安全与成本。每设备 `throughput_cost_coefficient` 对应式（31）的 c_e，按原式不额外乘 dt；从货币/MWh 报价换算时需先乘 dt。
 
-`time_limit`是每次求解器调用的限时，不是整个流程总限时。非凸全局检查可能较慢，代码不保证任何给定规模在固定时间内收敛。两时段小问题存在精确区间顶点加速分支，一般多时段问题仍使用全局非凸搜索。
+**修订后的 H 直接读取同一套最坏情景联合补偿解。** 全网总缺口最小后，保持该最小值不变，再联合最小化节点时段缺口平方和，统一处理多解。所有 H 来自同一个 delta、同一套储能和网络解；同节点用户共享指标。H 用于升档，不代表责任归因。全过程见 `operational.joint_diagnostic`，保留情景、储能轨迹、节点缺口、H、求解状态与矩阵重建接口。
 
-## 许可
+只有最坏情景及联合缺口分配均验证通过才自动升档。全局界未闭合时保留反例与诊断，返回 `unverified`。若缺口只在无用户节点或用户指标均低于容差，返回 `stalled`；若所选用户已达最高档，返回 `no_feasible_scheme`，不据此证明其他档位组合无解。
 
-本项目使用[MIT License](LICENSE)。论文级使用应自行核对建模假设、数据来源、求解状态和数值残差，不应将合成示例表现外推为真实系统保证。
+小规模集合完整枚举多面体所有顶点；较大集合用全局非凸对偶/强对偶检验。抽样、单条申报可行、没找到反例都不等于全域证明。高维检验可能超时，返回 `unverified` 和现有上下界。
+
+## 换数据和旧版迁移
+
+用 `with_declaration_model(old_data, rho_table, s_table, storage_cost_coefficients)` 保留物理数据并显式更换响应参数；旧 beta、阈值和 xi 不能直接解释为 rho、s。schema 3 的反馈接口第三参数是完整申报字典，不再只是档位。
+
+支持单电压等级、固定辐射拓扑、无损 LinDistFlow、理想储能、给定净无功、单节点用户和执行前整周期反馈；支持任意有限激励档位数、非连续节点 ID、反向支路、独立线路界、不同等长时段与零台储能。网状网络、多电压等级、AC/三相、有损储能和实时非预知反馈需要扩展模型。
+
+仓库使用 [MIT License](LICENSE)，仅包含通用算法、接口文档、合成示例和测试；不包含研究文档附件、原项目实验数据或计算结果。

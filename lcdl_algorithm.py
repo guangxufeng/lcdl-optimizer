@@ -1,4 +1,4 @@
-"""两阶段 LCDL 模型 v2：理想储能、固定交换、情景自适应模式。
+"""LCDL: declared-response model (schema 3), plus legacy robust schema 1/2.
 
 Public API: Case, SolverOptions, compute_unified_directrix, compute_directrix,
 solve_scenario, run_two_stage, export_result, validate_feedback, dispatch_feedback.
@@ -40,6 +40,8 @@ class SolverOptions:
     output_flag: bool = False
     log_dir: str | None = None
     two_period_vertex_limit: int = 6  # exact interval reduction ONLY when T=2; 0 disables it
+    declaration_vertex_limit: int = 256  # exhaustive polytope vertices; 0 forces the global dual
+    optimize_robust_cost: bool = True
 
     def __post_init__(self):
         if self.time_limit <= 0 or self.max_iterations < 1 or self.threads < 1:
@@ -48,6 +50,8 @@ class SolverOptions:
             raise ValueError("容差必须为正。")
         if self.two_period_vertex_limit<0 or self.two_period_vertex_limit>12:
             raise ValueError("two_period_vertex_limit must lie in 0..12")
+        if self.declaration_vertex_limit < 0:
+            raise ValueError("declaration_vertex_limit must be nonnegative")
 
 
 def _array(value, shape=None, name="array"):
@@ -68,8 +72,9 @@ class Case:
     def __init__(self, data):
         data = copy.deepcopy(data)
         self.data = data
-        if data.get("schema_version") not in (1, 2):
+        if data.get("schema_version") not in (1, 2, 3):
             raise ModelDataError("Unsupported schema_version")
+        self.declaration_model = data["schema_version"] == 3
         self.name = str(data["name"])
         self.ids = list(data["bus_ids"])
         self.n = len(self.ids)
@@ -106,6 +111,12 @@ class Case:
         self.s = len(self.stores)
         self.storage_map = np.zeros((self.n, self.s))
         for s, b in enumerate(self.stores):
+            if self.declaration_model:
+                b.setdefault("cost_per_mwh", 0.0)  # legacy metadata, not v3's Eq. (31)
+                if "throughput_cost_coefficient" not in b:
+                    raise ModelDataError("v3 storage requires throughput_cost_coefficient for Eq. (31)")
+                if not np.isfinite(b["throughput_cost_coefficient"]) or b["throughput_cost_coefficient"] < 0:
+                    raise ModelDataError("throughput_cost_coefficient must be nonnegative and finite")
             b.setdefault("eta_charge", 1.0)
             b.setdefault("eta_discharge", 1.0)
             if b["bus"] not in self.index:
@@ -137,6 +148,13 @@ class Case:
             raise ModelDataError("grid_min_mw > grid_max_mw")
         # Legacy price metadata is not used: the new model has NO supplemental grid purchase.
         self.price = np.zeros(self.t)
+        if self.declaration_model:
+            self._declaration_parameters()
+            self._network()
+            for name,count in (("user_ids",self.k),("storage_ids",self.s)):
+                if name in data and (len(data[name])!=count or len(set(data[name]))!=count):
+                    raise ModelDataError(f"{name} must contain {count} unique identifiers")
+            return
         self.prices = _array(data["incentive_prices_per_mwh"], (4,), "incentive_prices_per_mwh")
         self.thresholds = _array(data["response_thresholds"], (self.k, 4), "response_thresholds")
         self.beta = float(data["beta"])
@@ -155,6 +173,28 @@ class Case:
         for name,count in (("user_ids",self.k),("storage_ids",self.s)):
             if name in data and (len(data[name])!=count or len(set(data[name]))!=count):
                 raise ModelDataError(f"{name} must contain {count} unique identifiers")
+
+    def _declaration_parameters(self):
+        """Schema 3 is the declared-response model; schema 1/2 remain legacy robust inputs."""
+        d = self.data
+        self.prices = _array(d["incentive_prices_per_mwh"], name="incentive_prices_per_mwh")
+        if self.prices.ndim != 1 or not len(self.prices) or (self.prices < 0).any() or (np.diff(self.prices) <= 0).any():
+            raise ModelDataError("Incentive prices must be a nonnegative strictly increasing vector")
+        self.tiers = len(self.prices)
+        self.response_degrees = _array(d["response_degrees"], (self.k, self.tiers), "response_degrees")
+        self.deviation_factors = _array(d["deviation_factors"], (self.k, self.tiers), "deviation_factors")
+        if ((self.response_degrees < 0) | (self.response_degrees > 1)).any() or (np.diff(self.response_degrees, axis=1) < 0).any():
+            raise ModelDataError("response_degrees must be in [0,1] and nondecreasing across tiers")
+        if ((self.deviation_factors < 0) | (self.deviation_factors >= 1)).any():
+            raise ModelDataError("deviation_factors must be in [0,1)")
+        # Eq. (32) assumes one fixed connection node per user/aggregator.
+        self.user_nodes = np.argmax(self.w, axis=0)
+        expected = np.zeros_like(self.w)
+        expected[self.user_nodes, np.arange(self.k)] = 1
+        if not np.allclose(self.w, expected, atol=1e-12, rtol=0):
+            raise ModelDataError("Declared-response model requires each user to connect to one fixed node")
+        if "slack_penalty" in d or "throughput_coefficient" in d:
+            raise ModelDataError("v3 separates slack and cost objectives; remove v2 global penalty/cost fields")
 
     def _network(self):
         branches = self.data["branches"]
@@ -326,6 +366,8 @@ def compute_directrix(case, opts=None):
 
 class UncertaintySet:
     def __init__(self, case, directrix, levels):
+        if case.declaration_model:
+            raise ModelDataError("Schema 3 uses declarations and feedback bands, not the legacy robust uncertainty set")
         self.case = case
         self.l = _array(directrix["L"], (case.k, case.t), "L")
         levels = np.asarray(levels)
@@ -956,3 +998,611 @@ def json_ready(value):
     if isinstance(value, np.integer):
         return int(value)
     return value
+
+
+# Keep the previous published model callable for existing research scripts.
+_legacy_run_two_stage = run_two_stage
+_legacy_run_incentive_loop = run_incentive_loop
+_legacy_validate_feedback = validate_feedback
+_legacy_dispatch_feedback = dispatch_feedback
+_legacy_export_result = export_result
+
+
+def _levels(case, levels):
+    a = _array(levels, (case.k,), "levels")
+    if (a != np.floor(a)).any() or ((a < 1) | (a > case.tiers)).any():
+        raise ModelDataError(f"levels must contain integers in 1..{case.tiers}")
+    return a.astype(int)
+
+
+def with_declaration_model(data,response_degrees,deviation_factors,storage_cost_coefficients=None):
+    """Explicitly migrate physical case data; old thresholds cannot determine rho or s."""
+    out=copy.deepcopy(data)
+    for key in ("response_thresholds","beta","xi_lower","xi_upper","diagnostic_penalty","slack_penalty","throughput_coefficient"):
+        out.pop(key,None)
+    out.update(schema_version=3,response_degrees=json_ready(response_degrees),deviation_factors=json_ready(deviation_factors))
+    if storage_cost_coefficients is not None:
+        costs=_array(storage_cost_coefficients,(len(out["storage"]),),"storage_cost_coefficients")
+        for device,cost in zip(out["storage"],costs): device["throughput_cost_coefficient"]=float(cost)
+    return out
+
+
+def make_declaration(case, directrix, levels, response_degree=None,
+                     deviation_factor=None, declared_p_mw=None):
+    """v3 Eq. (18)--(25). Tables are an explicit simulation of user declarations.
+
+    Real applications may pass the user's rho, s and declared curve explicitly.
+    The curve is checked against Eq. (18), not merely against energy conservation.
+    """
+    if not case.declaration_model:
+        raise ModelDataError("make_declaration requires schema_version=3")
+    lv = _levels(case, levels)
+    rho = _array(case.response_degrees[np.arange(case.k), lv-1] if response_degree is None
+                 else response_degree, (case.k,), "response_degree")
+    s = _array(case.deviation_factors[np.arange(case.k), lv-1] if deviation_factor is None
+               else deviation_factor, (case.k,), "deviation_factor")
+    if ((rho < 0) | (rho > 1)).any() or ((s < 0) | (s >= 1)).any():
+        raise ModelDataError("Require 0<=rho<=1 and 0<=s<1")
+    target = _array(directrix["target_dr_mw"], (case.k, case.t), "target_dr_mw")
+    expected = case.pre + rho[:, None] * (target-case.pre)
+    p = expected if declared_p_mw is None else _array(declared_p_mw, expected.shape, "declared_p_mw")
+    if not np.allclose(p, expected, atol=1e-8, rtol=1e-8):
+        raise ModelDataError("Declared curve does not satisfy Eq. (18) for the supplied rho")
+    residual = case.dt*p.sum(axis=1)-case.energy
+    if (p < -1e-9).any() or not np.allclose(residual, 0, atol=1e-8, rtol=0):
+        raise ModelDataError("Declaration must be nonnegative and conserve cycle energy")
+    return {"levels":lv, "response_degree":rho.copy(), "deviation_factor":s.copy(),
+            "declared_p_mw":p.copy(), "lower_p_mw":(1-s[:, None])*p,
+            "upper_p_mw":(1+s[:, None])*p, "energy_residual_mwh":residual,
+            "incentive_prices_per_mwh":case.prices[lv-1],
+            "deviation_from_target_mw":p-target,
+            "scope":"center and bounds defining the declared uncertainty set; global verification required"}
+
+
+class DeclarationSystem:
+    """Inspectable sparse model A y <= b, C y = e for fixed declared power.
+
+    y = [charge, discharge, virtual_increase, virtual_decrease], entity-major.
+    Signed virtual load acts at every non-root node as in v3 Eq. (36).
+    No extra per-node cycle, direction or corrected-DR constraints are imposed.
+    """
+    def __init__(self, case, directrix, response_p_mw, allow_virtual=True, node_objective=None):
+        if not case.declaration_model:
+            raise ModelDataError("DeclarationSystem requires schema_version=3")
+        self.case, self.directrix, self.allow_virtual = case, directrix, bool(allow_virtual)
+        self.node_objective = node_objective
+        c = case
+        self.response = _array(response_p_mw, (c.k,c.t), "response_p_mw")
+        if (self.response < 0).any() or not np.allclose(c.dt*self.response.sum(axis=1), c.energy, atol=1e-8, rtol=1e-9):
+            raise ModelDataError("Fixed response must be nonnegative and conserve cycle energy")
+        st, nt = c.s*c.t, c.n*c.t
+        self.ny = 2*st+2*nt
+        self.slices = {"charge":slice(0,st), "discharge":slice(st,2*st),
+                       "virtual_increase":slice(2*st,2*st+nt),
+                       "virtual_decrease":slice(2*st+nt,self.ny)}
+        eye = sp.eye(self.ny,format="csr")
+        ch, dis, vp, vm = [eye[self.slices[key]] for key in self.slices]
+        self.virtual_map = vp-vm
+        ws = sp.kron(c.storage_map, sp.eye(c.t),format="csr")
+        self.physical_map = ws @ (ch-dis)
+        self.net_map = self.physical_map+self.virtual_map
+        self.base = c.p-c.renew+c.w@self.response
+        aa,bb,cc,ee = [],[],[],[]
+        self.inequality_groups, self.equality_groups = [],[]
+        def rows(matrix,rhs,name,equality=False):
+            dest,vec,groups = (cc,ee,self.equality_groups) if equality else (aa,bb,self.inequality_groups)
+            mat = sp.csr_matrix(matrix)
+            start = sum(x.shape[0] for x in dest)
+            dest.append(mat);vec.append(np.broadcast_to(np.asarray(rhs,float),(mat.shape[0],)).copy())
+            groups.append({"name":name,"start":start,"stop":start+mat.shape[0]})
+        rows(-eye,0,"all_nonnegative")
+        if c.s:
+            rows(ch,np.repeat([s["p_charge_mw"] for s in c.stores],c.t),"charge_limits")
+            rows(dis,np.repeat([s["p_discharge_mw"] for s in c.stores],c.t),"discharge_limits")
+            accum = c.dt*sp.kron(sp.eye(c.s),np.tril(np.ones((c.t,c.t))),format="csr")@(ch-dis)
+            rows(accum,np.repeat([s["e_max_mwh"]-s["e_initial_mwh"] for s in c.stores],c.t),"energy_upper")
+            rows(-accum,np.repeat([s["e_initial_mwh"]-s["e_min_mwh"] for s in c.stores],c.t),"energy_lower")
+            rows(accum[np.arange(c.s)*c.t+c.t-1],0,"terminal_energy",True)
+        active = np.zeros(c.n,dtype=bool)
+        if allow_virtual: active[:] = True
+        active[c.root] = False
+        inactive_rows = np.flatnonzero(np.repeat(~active,c.t))
+        rows(vp[inactive_rows],0,"inactive_virtual_increase",True)
+        rows(vm[inactive_rows],0,"inactive_virtual_decrease",True)
+        total = sp.kron(np.ones((1,c.n)),sp.eye(c.t),format="csr")
+        rows(total@self.net_map,directrix["grid_plan_mw"]-self.base.sum(axis=0),"fixed_exchange",True)
+        flow = sp.kron(c.downstream,sp.eye(c.t),format="csr")
+        f0 = flow@self.base.ravel()
+        rows(flow@self.net_map,np.repeat(c.line_max,c.t)-f0,"line_upper")
+        rows(-flow@self.net_map,f0-np.repeat(c.line_min,c.t),"line_lower")
+        v = sp.kron(c.vp,sp.eye(c.t),format="csr")
+        v0 = (c.v0**2-c.vp@self.base-c.vq@c.q).ravel()
+        rows(v@self.net_map,v0-np.repeat(c.vmin**2,c.t),"voltage_lower")
+        rows(-v@self.net_map,np.repeat(c.vmax**2,c.t)-v0,"voltage_upper")
+        self.A,self.b = sp.vstack(aa,format="csr"),np.concatenate(bb)
+        self.C,self.e = sp.vstack(cc,format="csr"),np.concatenate(ee)
+        device_cost = np.repeat([s["throughput_cost_coefficient"] for s in c.stores], c.t)
+        weights = np.ones(c.n) if node_objective is None else np.eye(c.n)[node_objective]
+        self.cost = np.r_[np.zeros(2*st),np.tile(np.repeat(weights,c.t),2)] if allow_virtual else np.r_[np.tile(device_cost,2),np.zeros(2*nt)]
+        # Uncertainty is delta in MW about self.response. All dependence is affine in RHS.
+        wdelta = sp.kron(c.w,sp.eye(c.t),format="csr")
+        bblocks=[]
+        bmaps={"line_upper":-flow@wdelta,"line_lower":flow@wdelta,
+               "voltage_lower":-v@wdelta,"voltage_upper":v@wdelta}
+        for group in self.inequality_groups:
+            bblocks.append(bmaps.get(group["name"],sp.csr_matrix((group["stop"]-group["start"],c.k*c.t))))
+        self.B=sp.vstack(bblocks,format="csr")
+        self.F=sp.vstack([-total@wdelta if g["name"]=="fixed_exchange" else sp.csr_matrix((g["stop"]-g["start"],c.k*c.t))
+                         for g in self.equality_groups],format="csr")
+
+    def unpack(self,y):
+        c=self.case
+        values={key:y[sl].reshape(c.s if key in ("charge","discharge") else c.n,c.t)
+                for key,sl in self.slices.items()}
+        ch,dis=values["charge"],values["discharge"]
+        virtual=values["virtual_increase"]-values["virtual_decrease"]
+        epsilon=np.abs(virtual)
+        initial=np.array([s["e_initial_mwh"] for s in c.stores])[:,None]
+        capacity=np.array([s["e_max_mwh"] for s in c.stores])[:,None]
+        energy=initial+c.dt*np.cumsum(ch-dis,axis=1)
+        physical=self.base+(self.physical_map@y).reshape(c.n,c.t)
+        net=physical+virtual
+        throughput=c.dt*(ch+dis).sum(axis=1)
+        storage_cost=np.array([s["throughput_cost_coefficient"] for s in c.stores])*(ch+dis).sum(axis=1)
+        slack_amount=float(epsilon.sum() if self.node_objective is None else epsilon[self.node_objective].sum())
+        return {"charge_mw":ch,"discharge_mw":dis,"mode_u":(ch>0).astype(int),
+                "mode_z":(ch>0).astype(int),"storage_net_injection_mw":dis-ch,
+                "energy_mwh":energy,"energy_with_initial_mwh":np.concatenate([initial,energy],axis=1),
+                "soc_fraction":np.divide(energy,capacity,out=np.zeros_like(energy),where=capacity>0),
+                "terminal_energy_residual_mwh":energy[:,-1]-initial.ravel(),
+                "response_dr_mw":self.response.copy(),"virtual_adjustment_mw":virtual,"epsilon_mw":epsilon,
+                "virtual_increase_mw":values["virtual_increase"],"virtual_decrease_mw":values["virtual_decrease"],
+                "virtual_cycle_residual_mwh":c.dt*virtual.sum(axis=1),
+                "corrected_node_dr_mw":c.w@self.response+virtual,
+                "node_virtual_sum_mw":epsilon.sum(axis=1),
+                "diagnostic_indicator_mw":epsilon[c.user_nodes].sum(axis=1),
+                "physical_net_p_mw":physical,"net_p_mw":net,
+                "physical_network":network_metrics(c,physical),
+                "grid_mw":self.directrix["grid_plan_mw"].copy(),
+                "power_balance_residual_mw":net.sum(axis=0)-self.directrix["grid_plan_mw"],
+                "physical_power_balance_residual_mw":physical.sum(axis=0)-self.directrix["grid_plan_mw"],
+                "throughput_mwh_per_storage":throughput,"storage_cost_per_device":storage_cost,
+                "cost_components":{"storage_throughput":float(storage_cost.sum()),"virtual_sum_mw":slack_amount},
+                "objective_kind":"minimum_virtual_sum" if self.allow_virtual else "minimum_storage_cost",
+                "cost":float(self.cost@y),**network_metrics(c,net)}
+
+
+def solve_declared_dispatch(case,directrix,response_p_mw,opts=None,allow_virtual=True,explicit_mip=True,node_objective=None):
+    """Solve one v3 response: Eq. (28)/(38) slack or Eq. (31) zero-slack cost."""
+    opts=opts or SolverOptions()
+    system=DeclarationSystem(case,directrix,response_p_mw,allow_virtual,node_objective)
+    m=_model("declared_storage_dispatch",opts)
+    y=m.addMVar(system.ny,lb=-GRB.INFINITY,name="dispatch")
+    m.addConstr(system.A@y<=system.b,name="inequality")
+    m.addConstr(system.C@y==system.e,name="equality")
+    if explicit_mip and case.s:
+        u=m.addMVar((case.s,case.t),vtype=GRB.BINARY,name="mode_u")
+        pc=np.array([s["p_charge_mw"] for s in case.stores])[:,None]
+        pd=np.array([s["p_discharge_mw"] for s in case.stores])[:,None]
+        m.addConstr(y[system.slices["charge"]].reshape(u.shape)<=pc*u)
+        m.addConstr(y[system.slices["discharge"]].reshape(u.shape)<=pd*(1-u))
+    m.setObjective(system.cost@y)
+    m.optimize()
+    result={"status":"infeasible" if m.Status==GRB.INFEASIBLE else "unverified",
+            "solver_status":int(m.Status),"runtime_seconds":float(m.Runtime),
+            "lower_bound":_bound(m,-float("inf")),"solution_count":int(m.SolCount),
+            "allow_virtual":bool(allow_virtual),"explicit_mip":bool(explicit_mip),
+            "executable":False,"robust_certified":False,
+            "scope":"fixed full-cycle response only"}
+    if m.SolCount:
+        yy=y.X.copy()
+        # Canonicalize both pairs without changing net power or any energy state.
+        for left,right in (("charge","discharge"),("virtual_increase","virtual_decrease")):
+            a,b=system.slices[left],system.slices[right]
+            net=yy[a]-yy[b]
+            yy[a],yy[b]=np.maximum(net,0),np.maximum(-net,0)
+        violation=float(max(np.max(system.A@yy-system.b,initial=0),np.max(np.abs(system.C@yy-system.e),initial=0)))
+        dispatch=system.unpack(yy)
+        zero=bool(np.max(dispatch["epsilon_mw"],initial=0)<=opts.feasibility_tol)
+        physical_ok=bool(np.max(np.abs(dispatch["physical_power_balance_residual_mw"]),initial=0)<=opts.feasibility_tol
+                         and dispatch["physical_network"]["line_violation_count"]==0
+                         and dispatch["physical_network"]["voltage_violation_count"]==0)
+        optimal=m.Status==GRB.OPTIMAL and violation<=opts.feasibility_tol
+        result.update(status=("optimal" if zero and physical_ok else "requires_upgrade") if optimal else "unverified",
+                      objective=dispatch["cost"],y=yy,dispatch=dispatch,max_constraint_violation=violation,
+                      zero_slack=zero,executable=bool(optimal and zero and physical_ok),
+                      cost_optimality_certified=bool(optimal),solver_objective=float(m.ObjVal))
+    m.dispose()
+    return result
+
+
+class DeclaredUncertaintySet:
+    """v3 Eq. (24): a product of MW boxes intersected with per-user zero sums."""
+    def __init__(self,case,declaration):
+        self.case=case
+        self.declaration=declaration
+        self.center=_array(declaration["declared_p_mw"],(case.k,case.t),"declared_p_mw")
+        widths=_array(declaration["deviation_factor"],(case.k,),"deviation_factor")[:,None]*self.center
+        self.lo=np.maximum(-widths,-self.center)
+        self.hi=widths
+
+    def contains(self,delta,tol=1e-8):
+        x=np.asarray(delta,dtype=float)
+        return bool(x.shape==self.lo.shape and np.isfinite(x).all() and
+                    (x>=self.lo-tol).all() and (x<=self.hi+tol).all() and
+                    np.max(np.abs(self.case.dt*x.sum(axis=1)))<=tol)
+
+    def project(self,delta):
+        x=_array(delta,self.lo.shape,"delta_mw").copy()
+        for k in range(self.case.k):
+            lo=float(np.min(x[k]-self.hi[k])-1);hi=float(np.max(x[k]-self.lo[k])+1)
+            for _ in range(90):
+                mid=(lo+hi)/2
+                if np.clip(x[k]-mid,self.lo[k],self.hi[k]).sum()>0: lo=mid
+                else: hi=mid
+            x[k]=np.clip(x[k]-(lo+hi)/2,self.lo[k],self.hi[k])
+        return x
+
+    def vertices(self,limit):
+        """Complete vertex enumeration only; return None if its safe count cap is exceeded."""
+        if limit==0: return None
+        per_user=[];count=1
+        for k in range(self.case.k):
+            free=np.flatnonzero(self.hi[k]>self.lo[k])
+            if len(free)==0:
+                candidates=[self.lo[k].copy()]
+            else:
+                # A box intersected with one equality has all but <=1 coordinates at bounds.
+                if len(free)>20 or len(free)*2**(len(free)-1)*count>limit:
+                    return None
+                candidates=[]
+                for pivot in free:
+                    others=[j for j in free if j!=pivot]
+                    for bits in itertools.product((0,1),repeat=len(others)):
+                        x=self.lo[k].copy()
+                        for j,bit in zip(others,bits): x[j]=self.hi[k,j] if bit else self.lo[k,j]
+                        x[pivot]=-np.sum(np.delete(x,pivot))
+                        if self.lo[k,pivot]-1e-12<=x[pivot]<=self.hi[k,pivot]+1e-12:
+                            if not any(np.max(np.abs(x-v))<1e-12 for v in candidates): candidates.append(x)
+            if not candidates: raise ModelDataError("Empty declared uncertainty set")
+            per_user.append(candidates);count*=len(candidates)
+            if count>limit: return None
+        return [np.stack(vertex) for vertex in itertools.product(*per_user)]
+
+    def parameters(self):
+        return {"center_p_mw":self.center.copy(),"delta_lower_mw":self.lo.copy(),
+                "delta_upper_mw":self.hi.copy(),"energy_equality":"dt*sum_t(delta[k,t])=0",
+                "nonnegative_response":True,"units":"MW","geometry":"product_of_box_zero_sum_polytopes"}
+
+
+def declared_global_oracle(case,directrix,declaration,opts=None,allow_virtual=True,node_objective=None):
+    """Maximize the exact LP value over the whole v3 polytope, with valid bounds.
+
+    Ideal efficiency and nonnegative costs imply scenario-wise binary equivalence.
+    For large polytopes maximize the LP dual over delta and unrestricted duals;
+    use Gurobi global nonconvex bounds, never a sampled maximum as a certificate.
+    """
+    opts=opts or SolverOptions()
+    uncertainty=DeclaredUncertaintySet(case,declaration)
+    system=DeclarationSystem(case,directrix,uncertainty.center,allow_virtual,node_objective)
+    vertices=uncertainty.vertices(opts.declaration_vertex_limit)
+    results=[]
+    def solve(delta):
+        r=solve_declared_dispatch(case,directrix,uncertainty.center+delta,opts,
+                                 allow_virtual,False,node_objective)
+        row={"delta_mw":delta.copy(),**r}
+        results.append(row)
+        return row
+    best=None;lower=-float("inf")
+    upper=float("inf")
+    solver_info={}
+    if vertices is not None:
+        complete=True;uppers=[]
+        for delta in vertices:
+            row=solve(delta)
+            valid=row.get("cost_optimality_certified",False)
+            complete &= valid
+            if valid:
+                uppers.append(row["objective"])
+                if row["lower_bound"]>lower: lower=row["lower_bound"];best=row
+        if complete: upper=max(uppers,default=0)
+        method="exhaustive_polytope_vertices"
+        solver_info={"expected_vertex_count":len(vertices),"evaluated_vertex_count":len(results)}
+    else:
+        # Center is a valid witness, not a proof of all-delta feasibility.
+        row=solve(np.zeros_like(uncertainty.center))
+        if row.get("cost_optimality_certified",False): lower=row["lower_bound"];best=row
+        m=_model("declared_global_dual",opts)
+        m.Params.NonConvex=2
+        delta=m.addMVar((case.k,case.t),lb=uncertainty.lo,ub=uncertainty.hi,name="delta_mw")
+        m.addConstr(delta.sum(axis=1)==0)
+        lam=m.addMVar(len(system.b),lb=-GRB.INFINITY,ub=0,name="inequality_dual")
+        nu=m.addMVar(len(system.e),lb=-GRB.INFINITY,name="equality_dual")
+        m.addConstr(system.A.T@lam+system.C.T@nu==system.cost)
+        if allow_virtual:
+            # Exact bounds from the +/- virtual columns, NOT a guessed multiplier big-M.
+            # Free virtual correction at node i bounds its nodal price by its objective weight.
+            weights=np.ones(case.n) if node_objective is None else np.eye(case.n)[node_objective]
+            bounds=np.repeat(weights[case.user_nodes],case.t)
+            nodal=m.addMVar(case.k*case.t,lb=-bounds,ub=bounds,name="bounded_uncertain_nodal_price")
+            m.addConstr(nodal==system.B.T@lam+system.F.T@nu)
+            m.setObjective(system.b@lam+system.e@nu+delta.reshape(-1)@nodal,GRB.MAXIMIZE)
+        else:
+            # Strong duality with a bounded primal retains a finite objective bound.
+            # This is the exact continuous-equivalent inner optimum, not arbitrary dispatch cost.
+            upper_y=np.r_[np.repeat([s["p_charge_mw"] for s in case.stores],case.t),
+                          np.repeat([s["p_discharge_mw"] for s in case.stores],case.t),
+                          np.zeros(2*case.n*case.t)]
+            primal=m.addMVar(system.ny,lb=0,ub=upper_y,name="bounded_zero_virtual_primal")
+            m.addConstr(system.A@primal<=system.b+system.B@delta.reshape(-1))
+            m.addConstr(system.C@primal==system.e+system.F@delta.reshape(-1))
+            dual_value=(system.b+system.B@delta.reshape(-1))@lam+(system.e+system.F@delta.reshape(-1))@nu
+            m.addConstr(system.cost@primal==dual_value)
+            m.setObjective(system.cost@primal,GRB.MAXIMIZE)
+        m.optimize()
+        solver_info={"solver_status":int(m.Status),"runtime_seconds":float(m.Runtime),
+                     "solver_incumbent":float(m.ObjVal) if m.SolCount else None,
+                     "global_upper_bound":_bound(m,float("inf"))}
+        upper=solver_info["global_upper_bound"]
+        if m.SolCount:
+            witness=uncertainty.project(delta.X)
+            if uncertainty.contains(witness):
+                row=solve(witness)
+                if row.get("cost_optimality_certified",False) and row["lower_bound"]>lower:
+                    lower=row["lower_bound"];best=row
+        m.dispose()
+        method="global_bilinear_LP_dual_no_multiplier_cutoff"
+    tolerance=opts.feasibility_tol if allow_virtual else opts.cost_abs_tol+opts.cost_rel_tol*max(1,abs(lower))
+    # A numerical inconsistency must never close a certificate.
+    consistent=bool(np.isfinite(lower) and lower<=upper+tolerance)
+    return {"method":method,"lower_bound":lower,"upper_bound":upper,
+            "bounds_consistent":consistent,"gap":upper-lower,
+            "optimality_certified":bool(consistent and np.isfinite(upper) and upper-lower<=tolerance),
+            "zero_certified":bool(consistent and upper<=opts.feasibility_tol),
+            "positive_certified":bool(lower>opts.feasibility_tol),
+            "witness":best,"scenario_results":results,"solver":solver_info,
+            "objective":"eta" if allow_virtual and node_objective is None else
+                        ("H_node" if allow_virtual else "J"),"node_objective":node_objective,
+            "uncertainty":uncertainty.parameters()}
+
+
+def joint_gap_diagnostic(case,directrix,witness,opts=None):
+    """Select one joint minimum-total-gap solution using a convex tie-break.
+
+    The secondary objective sum(epsilon**2) uniquely selects node/time gap
+    magnitudes at the fixed scenario; it does not attribute user responsibility.
+    """
+    opts=opts or SolverOptions()
+    system=DeclarationSystem(case,directrix,witness["dispatch"]["response_dr_mw"])
+    m=_model("joint_gap_tie_break",opts)
+    y=m.addMVar(system.ny,lb=-GRB.INFINITY,name="joint_dispatch")
+    m.addConstr(system.A@y<=system.b)
+    m.addConstr(system.C@y==system.e)
+    total=float(witness["objective"])
+    m.addConstr(system.cost@y==total,name="fixed_minimum_total_gap")
+    epsilon=y[system.slices["virtual_increase"]]+y[system.slices["virtual_decrease"]]
+    m.setObjective(epsilon@epsilon)
+    m.optimize()
+    result={"status":"unverified","selection_rule":"minimum_sum_squared_node_time_gap",
+            "delta_mw":witness["delta_mw"].copy(),"primary_objective":total,
+            "solver_status":int(m.Status),"runtime_seconds":float(m.Runtime),
+            "selection_certified":False}
+    if m.SolCount:
+        yy=y.X.copy()
+        for left,right in (("charge","discharge"),("virtual_increase","virtual_decrease")):
+            a,b=system.slices[left],system.slices[right]
+            net=yy[a]-yy[b]
+            yy[a],yy[b]=np.maximum(net,0),np.maximum(-net,0)
+        violation=float(max(np.max(system.A@yy-system.b,initial=0),
+                            np.max(np.abs(system.C@yy-system.e),initial=0),
+                            abs(system.cost@yy-total)))
+        dispatch=system.unpack(yy)
+        valid=m.Status==GRB.OPTIMAL and violation<=opts.feasibility_tol
+        result.update(status="optimal" if valid else "unverified",selection_certified=bool(valid),
+                      y=yy,dispatch=dispatch,H_mw=dispatch["diagnostic_indicator_mw"],
+                      secondary_objective=float(np.square(dispatch["epsilon_mw"]).sum()),
+                      max_constraint_violation=violation)
+    m.dispose()
+    return result
+
+
+def solve_declared_robust(case,directrix,declaration,opts=None):
+    opts=opts or SolverOptions()
+    feasibility=declared_global_oracle(case,directrix,declaration,opts)
+    base={"feasibility":feasibility,"robust_certified":False,"feasibility_certified":False,
+          "cost_optimality_certified":False,"status":"unverified"}
+    if feasibility["zero_certified"]:
+        base.update(status="robust_feasible",feasibility_certified=True,robust_certified=True)
+        if opts.optimize_robust_cost:
+            cost=declared_global_oracle(case,directrix,declaration,opts,allow_virtual=False)
+            base.update(cost=cost,cost_optimality_certified=cost["optimality_certified"],
+                        status="robust_optimal" if cost["optimality_certified"] else "robust_feasible_cost_unverified")
+        return base
+    if not feasibility["positive_certified"]: return base
+    diagnostic=joint_gap_diagnostic(case,directrix,feasibility["witness"],opts)
+    diagnostic["scenario_is_certified_worst"]=feasibility["optimality_certified"]
+    diagnostic["upgrade_certified"]=bool(feasibility["optimality_certified"] and diagnostic["selection_certified"])
+    return {**base,"status":"proven_not_robust","joint_diagnostic":diagnostic,
+            "diagnostic_rule":"same_joint_solution_revised_equation_38"}
+
+
+def run_incentive_loop(case,opts=None,directrix=None,declaration_provider=None,initial_levels=None):
+    if not case.declaration_model:
+        if declaration_provider is not None or initial_levels is not None:
+            raise ModelDataError("Declaration options require schema_version=3")
+        return _legacy_run_incentive_loop(case,opts,directrix)
+    opts=opts or SolverOptions()
+    d=directrix if directrix is not None else compute_directrix(case,opts)
+    levels=_levels(case,np.ones(case.k) if initial_levels is None else initial_levels)
+    rounds=[]
+    previous=None
+    def finish(status,reason,**extra):
+        return {"status":status,"reason":reason,"levels":levels.copy(),"rounds":rounds,
+                "robust_certified":status in ("robust_feasible","robust_optimal","robust_feasible_cost_unverified"),
+                "declaration_feasible":status in ("robust_feasible","robust_optimal","robust_feasible_cost_unverified"),
+                "declaration":rounds[-1]["declaration"] if rounds else None,**extra}
+    for iteration in range(int(np.sum(case.tiers-levels))+1):
+        context={"round_index":iteration,"levels":levels.copy(),"target_dr_mw":d["target_dr_mw"].copy(),
+                 "forecast_dr_mw":case.pre.copy(),"prices_per_mwh":case.prices[levels-1].copy(),
+                 "previous_round":copy.deepcopy(rounds[-1]) if rounds else None}
+        try:
+            supplied=None if declaration_provider is None else declaration_provider(copy.deepcopy(context))
+            if declaration_provider is not None and supplied is None:
+                return finish("awaiting_declaration","Provider returned None; obtain a new declaration at requested levels",
+                              requested_levels=levels.copy(),request=context)
+            declaration=make_declaration(case,d,levels,**({} if supplied is None else supplied))
+            if previous is not None and (declaration["response_degree"]<previous-1e-10).any():
+                raise ModelDataError("Re-declared rho must not decrease between incentive rounds")
+        except (ModelDataError,TypeError) as exc:
+            return finish("invalid_declaration",str(exc))
+        previous=declaration["response_degree"].copy()
+        op=solve_declared_robust(case,d,declaration,opts)
+        item={"round_index":iteration,"levels":levels.copy(),"declaration":declaration,
+              "declaration_source":"preset_response_table" if declaration_provider is None else "provider",
+              "operational":op}
+        rounds.append(item)
+        if op["feasibility_certified"]:
+            return finish(op["status"],"All responses in the declared set have zero-virtual recourse; confirm feedback before execution",
+                          feasibility_certified=True,cost_optimality_certified=op["cost_optimality_certified"])
+        if op["status"]!="proven_not_robust":
+            return finish(op["status"],"Global feasibility not certified; no unproven upgrades")
+        diagnostic=op["joint_diagnostic"]
+        if not diagnostic["upgrade_certified"]:
+            return finish("unverified","Non-robustness proven, but worst scenario or joint gap selection is not certified; no upgrade")
+        needs=diagnostic["H_mw"]>opts.upgrade_tol
+        upgrade=needs & (levels<case.tiers)
+        item.update(H_mw=diagnostic["H_mw"],needs_upgrade=needs,upgrade_mask=upgrade,
+                    next_levels=levels+upgrade.astype(int))
+        if not upgrade.any():
+            return finish("no_feasible_scheme" if needs.any() else "stalled",
+                          "Users selected by the joint gap rule are at the highest tier; this is not a proof over all other tier combinations" if needs.any() else "Positive total gap has no user-node component above tolerance; inspect non-user nodes and tolerances")
+        levels=levels+upgrade.astype(int)
+    return finish("stalled","Finite incentive bound reached")
+
+
+def _checked_declaration(case,directrix,declaration):
+    if not isinstance(declaration,dict):
+        raise ModelDataError("Schema 3 requires the saved declaration dict, not just incentive levels")
+    return make_declaration(case,directrix,declaration["levels"],declaration["response_degree"],
+                            declaration["deviation_factor"],declaration["declared_p_mw"])
+
+
+def validate_feedback(case,directrix,levels,feedback_p_mw):
+    """For schema 3 the third argument is the saved declaration, including rho and s."""
+    if not case.declaration_model:
+        return _legacy_validate_feedback(case,directrix,levels,feedback_p_mw)
+    dec=_checked_declaration(case,directrix,levels)
+    p=_array(feedback_p_mw,(case.k,case.t),"feedback_p_mw")
+    residual=case.dt*p.sum(axis=1)-case.energy
+    changed=not np.allclose(residual,0,atol=1e-8,rtol=0)
+    lower,upper=p-dec["lower_p_mw"],dec["upper_p_mw"]-p
+    in_bounds=bool((lower>=-1e-9).all() and (upper>=-1e-9).all() and (p>=0).all())
+    return {"in_set":in_bounds and not changed,"in_bounds":in_bounds,"energy_changed":changed,
+            "delta_mw":p-dec["declared_p_mw"],
+            "feedback_energy_mwh":case.dt*p.sum(axis=1),"energy_residual_mwh":residual,
+            "lower_margin_mw":lower,"upper_margin_mw":upper,"nonnegative_load_margin_mw":p.copy(),
+            "declaration":dec,"scope":"declared multiplicative power band and cycle energy only"}
+
+
+def dispatch_feedback(case,directrix,levels,feedback_p_mw,opts=None):
+    if not case.declaration_model:
+        return _legacy_dispatch_feedback(case,directrix,levels,feedback_p_mw,opts)
+    check=validate_feedback(case,directrix,levels,feedback_p_mw)
+    base={"feedback_check":check,"executable":False,"robust_certified":False}
+    if check["energy_changed"]:
+        return {**base,"status":"energy_changed","requires_stage1_rebuild":True,
+                "reason":"Feedback cycle energy changed; rebuild both stages"}
+    if not check["in_set"]:
+        return {**base,"status":"out_of_set","requires_new_declaration":True,
+                "reason":"Feedback outside declared band; obtain a new declaration"}
+    solved=solve_declared_dispatch(case,directrix,feedback_p_mw,opts,allow_virtual=False)
+    return {**solved,"feedback_check":check,"requires_new_declaration":not solved["executable"],
+            "reason":"Confirmed feedback is physically feasible" if solved["executable"] else
+                     "Within-band feedback is not automatically feasible; revise declaration or storage and repeat"}
+
+
+def run_two_stage(case,opts=None,declaration_provider=None,initial_levels=None,feedback_p_mw=None):
+    if not case.declaration_model:
+        if any(x is not None for x in (declaration_provider,initial_levels,feedback_p_mw)):
+            raise ModelDataError("New declaration/feedback options require schema_version=3")
+        return _legacy_run_two_stage(case,opts)
+    opts=opts or SolverOptions()
+    directrix={}
+    try:
+        directrix=compute_unified_directrix(case)
+        directrix=compute_directrix(case,opts)
+    except ModelDataError as exc:
+        stage2={"status":"stage1_failed","reason":str(exc),"rounds":[],"declaration_feasible":False}
+    else:
+        stage2=run_incentive_loop(case,opts,directrix,declaration_provider,initial_levels)
+    result={"result_schema_version":3,"model":"v3_declared_polytope_robust_storage",
+            "status":stage2["status"],"reason":stage2["reason"],"robust_certified":stage2.get("robust_certified",False),
+            "feasibility_certified":stage2.get("feasibility_certified",False),
+            "cost_optimality_certified":stage2.get("cost_optimality_certified",False),
+            "declaration_feasible":stage2["declaration_feasible"],"executable":False,
+            "input_case":copy.deepcopy(case.data),"solver_options":vars(opts).copy(),
+            "solution_method":"exact_continuous_equivalence_polytope_vertices_or_global_dual",
+            "axes":{"bus_ids":case.ids.copy(),"user_ids":case.data.get("user_ids",list(range(case.k))),
+                    "storage_ids":case.data.get("storage_ids",list(range(case.s))),
+                    "time_start_hours":np.arange(case.t)*case.dt,"state_time_hours":np.arange(case.t+1)*case.dt,
+                    "branches":case.oriented_branches,"array_order":"entity,time"},
+            "parameters":{"user_energy_mwh":case.energy.copy(),"dr_allocation":case.w.copy(),
+                          "user_node_indices":case.user_nodes.copy(),"downstream_matrix":case.downstream.copy(),
+                          "path_matrix":case.path.copy(),"voltage_active_sensitivity":case.vp.copy(),
+                          "voltage_reactive_sensitivity":case.vq.copy(),"fixed_reactive_flow_mvar":case.downstream@case.q,
+                          "objective_units":"eta/H sum virtual MW across periods; Eq.31 device coefficients include any desired dt scaling",
+                          "diagnostic_convention":"revised v3 Eq.38: same worst-scenario joint minimum-total-gap solution; minimum squared gap tie-break",
+                          "assumptions":{"ideal_efficiency":True,"fixed_exchange":True,"lossless_lindistflow":True,
+                                         "single_node_per_user":True,"full_cycle_feedback_before_dispatch":True}},
+            "stage1":directrix,"stage2":stage2}
+    if feedback_p_mw is not None and result["declaration_feasible"]:
+        execution=dispatch_feedback(case,directrix,stage2["declaration"],feedback_p_mw,opts)
+        result.update(execution=execution,executable=execution["executable"],
+                      status="ready_to_execute" if execution["executable"] else execution["status"],reason=execution["reason"])
+    return result
+
+
+def export_result(result,path,include_matrices=False):
+    if result.get("result_schema_version")!=3:
+        return _legacy_export_result(result,path,include_matrices)
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    artifact=copy.deepcopy(result)
+    artifact["source_sha256"]=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    if include_matrices and "L" in result["stage1"]:
+        case=Case(result["input_case"])
+        jobs=[]
+        for row in result["stage2"]["rounds"]:
+            name=f"round_{row['round_index']:03d}"
+            power=row["declaration"]["declared_p_mw"]
+            jobs.append((name+"_eta",power,True,None))
+            if "cost" in row["operational"]: jobs.append((name+"_cost",power,False,None))
+        if "dispatch" in result.get("execution",{}):
+            jobs.append(("feedback",result["execution"]["dispatch"]["response_dr_mw"],False,None))
+        artifact["matrix_exports"]={}
+        for name,power,virtual,node in jobs:
+            system=DeclarationSystem(case,result["stage1"],power,virtual,node)
+            folder=path.parent/(path.stem+"_matrices")/name
+            folder.mkdir(parents=True,exist_ok=True)
+            for key in ("A","B","C","F"):
+                sp.save_npz(folder/(key+".npz"),getattr(system,key))
+            np.savez(folder/"vectors.npz",b=system.b,e=system.e,c=system.cost)
+            artifact["matrix_exports"][name]={"directory":str(folder.relative_to(path.parent)),
+                "y_slices":{key:[sl.start,sl.stop] for key,sl in system.slices.items()},
+                "constraints":"A@y<=b+B@delta; C@y=e+F@delta; delta MW relative to declared center (feedback uses delta=0)",
+                "inequality_groups":system.inequality_groups,"equality_groups":system.equality_groups,
+                "binary_mode":{"shape":[case.s,case.t],"values":[0,1],
+                               "charge_limit_mw":[s["p_charge_mw"] for s in case.stores],
+                               "discharge_limit_mw":[s["p_discharge_mw"] for s in case.stores],
+                               "constraints":"charge<=Pch_max*u; discharge<=Pdis_max*(1-u)"}}
+        for row in artifact["stage2"]["rounds"]:
+            diagnostic=row["operational"].get("joint_diagnostic")
+            if diagnostic is not None:
+                diagnostic["model_export"]={
+                    "base_matrix_key":f"round_{row['round_index']:03d}_eta",
+                    "fixed_delta_mw":diagnostic["delta_mw"],
+                    "additional_equality":"c@y=primary_objective",
+                    "primary_objective":diagnostic["primary_objective"],
+                    "quadratic_objective":"sum((y[virtual_increase]+y[virtual_decrease])**2)",
+                    "interpretation":"all nodes and storage jointly solved; ideal-storage continuous equivalence"}
+    path.write_text(json.dumps(json_ready(artifact),ensure_ascii=False,indent=2,allow_nan=False),encoding="utf-8")
+    return path.resolve()
