@@ -1,29 +1,78 @@
 {
-  "schema_version": 2,
-  "name": "two_bus_minimal_example",
-  "bus_ids": [10, 99],
+  "schema_version": 3,
+  "name": "v3_declared_robust_minimal_example",
+  "bus_ids": [
+    10,
+    99
+  ],
   "root_bus": 10,
   "base_kv": 12.66,
   "dt_hours": 1.0,
   "branches": [
-    {"from_bus": 10, "to_bus": 99, "r_ohm": 0.1, "x_ohm": 0.05, "p_limit_mw": 5.0}
+    {
+      "from_bus": 10,
+      "to_bus": 99,
+      "r_ohm": 0.1,
+      "x_ohm": 0.05,
+      "p_limit_mw": 5.0
+    }
   ],
-  "rigid_p_mw": [[0.0, 0.0], [0.6, 0.6]],
-  "fixed_q_mvar": [[0.0, 0.0], [0.1, 0.1]],
-  "renewable_p_mw": [[0.0, 0.0], [0.0, 0.0]],
-  "dr_allocation": [[0.0], [1.0]],
-  "dr_pre_mw": [[0.4, 0.4]],
+  "rigid_p_mw": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.6,
+      0.6
+    ]
+  ],
+  "fixed_q_mvar": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.1,
+      0.1
+    ]
+  ],
+  "renewable_p_mw": [
+    [
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0
+    ]
+  ],
+  "dr_allocation": [
+    [
+      0.0
+    ],
+    [
+      1.0
+    ]
+  ],
+  "dr_pre_mw": [
+    [
+      0.7,
+      0.1
+    ]
+  ],
   "storage": [
     {
       "bus": 99,
-      "p_charge_mw": 0.3,
-      "p_discharge_mw": 0.4,
+      "p_charge_mw": 0.1,
+      "p_discharge_mw": 0.1,
       "e_min_mwh": 0.1,
       "e_max_mwh": 2.0,
       "e_initial_mwh": 1.0,
       "eta_charge": 1.0,
       "eta_discharge": 1.0,
-      "cost_per_mwh": 1.0
+      "cost_per_mwh": 1.0,
+      "throughput_cost_coefficient": 1.0
     }
   ],
   "root_voltage_pu": 1.0,
@@ -31,14 +80,36 @@
   "voltage_max_pu": 1.1,
   "grid_min_mw": 0.0,
   "grid_max_mw": 5.0,
-  "incentive_prices_per_mwh": [1.0, 2.0, 3.0, 4.0],
-  "response_thresholds": [[0.9, 0.95, 0.98, 0.99]],
-  "beta": 1.0,
-  "xi_lower": [[-0.05, -0.05]],
-  "xi_upper": [[0.05, 0.05]],
-  "diagnostic_penalty": 100.0,
-  "user_ids": ["user_99"],
-  "storage_ids": ["storage_99"],
+  "incentive_prices_per_mwh": [
+    1.0,
+    2.0,
+    3.0,
+    4.0
+  ],
+  "user_ids": [
+    "user_99"
+  ],
+  "storage_ids": [
+    "storage_99"
+  ],
   "seed": 20260916,
-  "provenance": {"purpose": "Synthetic two-period API tutorial; not an IEEE33 case or calibrated response dataset"}
+  "provenance": {
+    "purpose": "Synthetic two-period API tutorial; not an IEEE33 case or calibrated response dataset"
+  },
+  "response_degrees": [
+    [
+      0.0,
+      0.5,
+      0.8,
+      1.0
+    ]
+  ],
+  "deviation_factors": [
+    [
+      0.1,
+      0.1,
+      0.1,
+      0.05
+    ]
+  ]
 }
